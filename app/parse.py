@@ -1,14 +1,28 @@
 import csv
+import logging
 from dataclasses import dataclass, astuple, fields
 from urllib.parse import urljoin
 
 from selenium import webdriver
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+    WebDriverException,
+)
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 BASE_URL = "https://webscraper.io/"
 
@@ -21,16 +35,19 @@ PHONES_URL = urljoin(HOME_URL, "phones/")
 TOUCH_URL = urljoin(PHONES_URL, "touch")
 
 WAIT_SECONDS = 5
+COOKIE_WAIT_SECONDS = 2
 
 CLS_CARD = "card-body"
 CLS_ACCEPT_COOKIES = "acceptCookies"
-CLS_LOAD_MORE = "ecomerce-items-scroll-more"
+
 CLS_TITLE = "title"
 CLS_DESC = "description"
 CLS_PRICE = "price"
 CLS_REVIEW_COUNT = "review-count"
 CLS_STAR = "ws-icon-star"
 CSS_RATING = "p[data-rating]"
+
+CSS_LOAD_MORE = ".ecomerce-items-scroll-more, .ecommerce-items-scroll-more"
 
 
 @dataclass
@@ -55,17 +72,21 @@ FILE_COLLECTION = {
 
 
 def _safe_click_accept_cookies(driver: webdriver.Chrome, url: str) -> None:
+    wait = WebDriverWait(driver, COOKIE_WAIT_SECONDS)
     try:
-        driver.find_element(By.CLASS_NAME, CLS_ACCEPT_COOKIES).click()
-    except Exception:
-        print(f"No cookies found on {url}. Skipping.")
+        btn = wait.until(EC.element_to_be_clickable((By.CLASS_NAME, CLS_ACCEPT_COOKIES)))
+        btn.click()
+    except TimeoutException:
+        logger.info("No cookies found on %s. Skipping.", url)
+    except (ElementClickInterceptedException, WebDriverException) as exc:
+        logger.warning("Cookies click failed on %s: %s", url, exc)
 
 
 def _extract_rating(card: WebElement) -> int:
     try:
         raw = card.find_element(By.CSS_SELECTOR, CSS_RATING).get_attribute("data-rating")
         return int(raw)
-    except Exception:
+    except (NoSuchElementException, ValueError, WebDriverException):
         return len(card.find_elements(By.CLASS_NAME, CLS_STAR))
 
 
@@ -73,11 +94,11 @@ def _extract_reviews_count(card: WebElement) -> int:
     try:
         text = card.find_element(By.CLASS_NAME, CLS_REVIEW_COUNT).text
         return int(text.split()[0])
-    except Exception:
+    except (NoSuchElementException, ValueError, WebDriverException):
         return 0
 
 
-def create_product(card: WebElement) -> Product | None:
+def create_product(card: WebElement, *, url: str, index: int) -> Product | None:
     try:
         title_el = card.find_element(By.CLASS_NAME, CLS_TITLE)
         price_text = card.find_element(By.CLASS_NAME, CLS_PRICE).text
@@ -89,23 +110,31 @@ def create_product(card: WebElement) -> Product | None:
             rating=_extract_rating(card),
             num_of_reviews=_extract_reviews_count(card),
         )
-    except Exception as exc:
-        print(f"Skipping a product due to error: {exc}")
+    except (NoSuchElementException, ValueError, StaleElementReferenceException, WebDriverException) as exc:
+        logger.warning("Skipping product #%d on %s due to error: %s", index, url, exc)
         return None
 
 
-def _load_all_items(driver: webdriver.Chrome, wait: WebDriverWait) -> None:
+def _load_all_items(driver: webdriver.Chrome, wait: WebDriverWait, url: str) -> None:
     while True:
-        try:
-            before = len(driver.find_elements(By.CLASS_NAME, CLS_CARD))
-            btn = wait.until(EC.element_to_be_clickable((By.CLASS_NAME, CLS_LOAD_MORE)))
+        before = len(driver.find_elements(By.CLASS_NAME, CLS_CARD))
 
+        buttons = driver.find_elements(By.CSS_SELECTOR, CSS_LOAD_MORE)
+        if not buttons:
+            return
+
+        try:
+            btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, CSS_LOAD_MORE)))
             if not btn.is_displayed():
                 return
 
             driver.execute_script("arguments[0].click();", btn)
+
             wait.until(lambda d: len(d.find_elements(By.CLASS_NAME, CLS_CARD)) > before)
-        except Exception:
+        except TimeoutException:
+            return
+        except (ElementClickInterceptedException, StaleElementReferenceException, WebDriverException) as exc:
+            logger.warning("Pagination failed on %s (loaded=%d): %s", url, before, exc)
             return
 
 
@@ -117,17 +146,21 @@ def scrap_single_page(driver: webdriver.Chrome, url: str) -> list[Product]:
 
     try:
         wait.until(EC.presence_of_element_located((By.CLASS_NAME, CLS_CARD)))
-    except Exception:
-        print(f"No products found on {url}. Skipping.")
+    except TimeoutException:
+        logger.info("No products found on %s. Skipping.", url)
         return []
 
-    _load_all_items(driver, wait)
+    _load_all_items(driver, wait, url)
 
     cards = driver.find_elements(By.CLASS_NAME, CLS_CARD)
-    print(f"Finished loading {url}. Total items: {len(cards)}")
+    logger.info("Finished loading %s. Total items: %d", url, len(cards))
 
-    products = (create_product(card) for card in cards)
-    return [p for p in products if p is not None]
+    products: list[Product] = []
+    for idx, card in enumerate(cards):
+        p = create_product(card, url=url, index=idx)
+        if p is not None:
+            products.append(p)
+    return products
 
 
 def write_products_to_csv(products: list[Product], file_name: str) -> None:
